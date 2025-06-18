@@ -1,0 +1,88 @@
+---
+title: "01_demonstration"
+format: html
+editor: visual
+---
+
+## Histogram
+
+plot celltype distribution by sample
+
+```{r}
+plot_celltype_distribution_by_sample <- function(seurat_obj, 
+                                                 sample_col = "samples", 
+                                                 celltype_col = "cell_annotation", 
+                                                 title = "Cell Type Distribution by Treatment", 
+                                                 colors = NULL,
+                                                 save_path = NULL) {
+  library(ggplot2)
+  library(dplyr)
+  library(RColorBrewer)
+  
+  # Step 1: Count cells per sample and celltype
+  celltype_counts <- seurat_obj@meta.data %>%
+    dplyr::group_by(.data[[sample_col]], .data[[celltype_col]]) %>%
+    dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+    dplyr::rename(samples = 1, celltype = 2)
+  
+  # Step 2: Normalize to get percentages
+  celltype_percent <- celltype_counts %>%
+    dplyr::group_by(samples) %>%
+    dplyr::mutate(percentage = count / sum(count) * 100)
+  
+  # Step 3: Define color palette
+  if (is.null(colors)) {
+    n_types <- length(unique(celltype_percent$celltype))
+    colors <- colorRampPalette(brewer.pal(8, "Pastel1"))(n_types)
+  }
+  
+  # Step 4: Create bar plot
+  p <- ggplot(celltype_percent, aes(x = samples, y = percentage, fill = celltype)) +
+    geom_bar(stat = "identity", width = 0.75) +
+    scale_fill_manual(values = colors) +
+    labs(
+      title = title,
+      x = "Cytokine Treatment",
+      y = "Cell Type Percentage",
+      fill = "Cell Type"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16, color = "#6a51a3"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12, color = "#4d4d4d"),
+      axis.text.y = element_text(size = 12),
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+      panel.grid.major.y = element_line(color = "gray90")
+    )
+  
+  # Step 5: Optionally save
+  if (!is.null(save_path)) {
+    ggsave(save_path, plot = p, width = 10, height = 6)
+  }
+  
+  return(p)
+}
+```
+
+You can add options to executable code like this
+
+```{r}
+load("data/oIL9R_annotated.RData")
+barbie_colors <- c(
+  "#ff69b4", "#ffb6c1", "#ffc0cb", "#dda0dd", "#db7093",
+  "#f8c8dc", "#e75480", "#d8bfd8", "#ff82ab", "#da70d6"
+)
+
+# Call function
+plot_celltype_distribution_by_sample(
+  seurat_obj = oIL9R_main,
+  sample_col = "samples",
+  celltype_col = "cell_annotation",
+  title = "IL-9 Signaling: Cluster-Level Impact",
+  colors = barbie_colors,
+  save_path = "special_clusterdistribution.png"
+)
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
