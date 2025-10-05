@@ -1,0 +1,288 @@
+---
+title: "02_heatmap_demonstration"
+format: html
+editor: visual
+---
+
+---
+title: "Visualizing Cytokine Effects Across Cell Types with Seurat (Heatmap Demo)"
+author: "Pooja Paresh Savla"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    smooth-scroll: true
+  pdf: default
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+I built a compact workflow to **summarize how cytokine conditions shift gene expression across cell types** in a single-cell RNA-seq dataset. The pipeline takes a Seurat object and a DEG table, computes **log2 fold-changes (case vs control)** per cell type, optionally maps **Ensembl → MGI symbols**, and renders clean, publication-style heatmaps—one per condition.
+
+## Task
+
+For each cytokine condition, show the **most informative genes per cell type** and how their expression changes relative to **control (`box`)**, grouped by either **Seurat clusters** or **manual cell annotations**.
+
+::: callout-note
+#### Four complementary heatmaps per condition
+
+1.  **Ensembl ID × `seurat_clusters`** *(before biomaRt, before annotation)*\
+2.  **Ensembl ID × `cell_annotation`** *(before biomaRt, after annotation)*\
+3.  **Gene Symbol × `seurat_clusters`** *(after biomaRt, before annotation)*\
+4.  **Gene Symbol × `cell_annotation`** *(after biomaRt, after annotation)*
+:::
+
+## Methods (1-minute read)
+
+-   **Feature selection:** From `all_markers`, take top DE genes per cell type (by `avg_log2FC`), keep genes present in RNA counts.\
+-   **Aggregation:** Compute `AverageExpression(..., group.by = seurat_clusters | cell_annotation)` for **case** (cytokine) and **control** (`box`).\
+-   **Effect size matrix:**\
+    \[ \mathrm{LFC} ;=; \log\_2!\left(\frac{A+1}{B+1}\right), \] capped to (\[,-2,,2,\]) for a stable color scale.\
+-   **Labeling:** Toggle `use_biomart` inside the loop to map Ensembl IDs → **MGI symbols** for the “Gene Symbol” variants.\
+-   **Ordering:** Columns (cell types) by hierarchical clustering; rows (genes) ranked by max (\|\mathrm{LFC}\|) across cell types.\
+-   **Outputs:** Save one **PNG heatmap** and one **CSV** (`plot_df`) per condition × configuration.
+
+## Reproducible Example
+
+```{r}
+#| label: setup
+#| include: false
+# Quarto global setup (optional)
+
+library(reshape2)
+
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(SeuratObject))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(ggplot2))
+
+# gbT cell only
+suppressPackageStartupMessages(library(Signac))
+suppressPackageStartupMessages(library(Matrix))
+
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(plyr))
+
+save_plot_as_png <- function(plot, filename) {
+  png(filename, res = 250, width = 4000, height = 4000)
+  print(plot)
+  dev.off()
+}
+
+```
+
+```{r}
+load("data/demo_data_annotated_nobiomart.RData")
+all_combinations <- unique(demo_data$samples)[!unique(demo_data$samples) %in%  c("box")] 
+```
+
+```{r}
+Idents(demo_data) <- "samples"
+
+seurat_object <- demo_data
+
+degs_list <- data.frame()
+
+find_degs <- function(seurat_slice, cytokine, control = "box", min_cells = 3) {
+  if (length(which(seurat_slice$samples == cytokine)) >= min_cells &&
+      length(which(seurat_slice$samples == control)) >= min_cells) {
+    
+    markers <- FindMarkers(
+      seurat_slice, ident.1 = cytokine, ident.2 = control,
+      min.pct = 0.2, logfc.threshold = 0.1, test.use = "wilcox"
+    )
+    
+    if (nrow(markers) > 0) {
+      markers$fdr <- p.adjust(markers$p_val, "fdr")
+      markers$sample <- cytokine
+      markers$gene <- rownames(markers)
+      return(markers)
+    }
+  }
+  return(NULL)
+}
+
+# --- Generic runner: do DEGs for each group value (cluster or annotation) -----
+run_degs_by <- function(obj, group_col, cytokines, control = "box", min_cells = 3) {
+  meta   <- obj[[]]
+  groups <- sort(unique(meta[[group_col]]))
+
+  # For each group: subset once, then run all cytokines on that slice
+  res_per_group <- lapply(groups, function(g) {
+    cells_g <- rownames(meta)[meta[[group_col]] == g]
+    if (length(cells_g) < min_cells) return(NULL)
+
+    slice <- subset(obj, cells = cells_g)
+
+    # run all cytokines on the already subset slice
+    res_list <- lapply(cytokines, function(ck) find_degs(slice, ck, control, min_cells))
+    res <- bind_rows(res_list)
+    if (is.null(res) || nrow(res) == 0) return(NULL)
+
+    mutate(res, cell_type = g, group_by = group_col)
+  })
+
+  bind_rows(res_per_group)
+}
+```
+
+```{r}
+markers_clusters    <- run_degs_by(seurat_object, "seurat_clusters",  all_combinations, control = "box", min_cells = 3)
+markers_annotations <- run_degs_by(seurat_object, "cell_annotation",  all_combinations, control = "box", min_cells = 3)
+```
+
+```{r}
+
+# I cant use the subset function on seurat once i scaled the function there i will be using unscaled}
+# Function to compute and plot expression differences
+
+plot_lfc_heatmap <- function(seurat_object, all_markers, all_combinations,
+                             control = "box",
+                             group_col = c("seurat_clusters","cell_annotation"),
+                             cap = 2,
+                             out_prefix = "heatmap_ensembl",
+                             use_biomart = T,
+                             gene_map = NULL) {
+
+  group_col <- match.arg(group_col)
+  
+for (sample_ii in all_combinations) {
+
+  # Subset for selected cytokine condition
+  seurat_sub <- subset(seurat_object, subset = samples == sample_ii)
+  seurat_pbs <- subset(seurat_object, subset = samples == control) # Control condition
+
+  all_markers_sub <- subset(all_markers, sample == sample_ii)
+  all_markers_sub <- all_markers_sub[order(all_markers_sub$avg_log2FC, decreasing = TRUE), ]
+
+  all_markers_sub <- all_markers_sub %>% group_by(cell_type) %>% slice_head(n = 20)
+  all_markers_sub_unique <- all_markers_sub[!duplicated(all_markers_sub$gene), ]
+  top_genes_unique <- all_markers_sub_unique$gene
+
+  # Ensure `cell_type` is a factor with correct levels
+  all_markers_sub$cell_type <- factor(all_markers_sub$cell_type, levels = unique(all_markers_sub$cell_type))
+
+  # Extract only genes present in RNA assay
+  valid_genes <- all_markers_sub$gene[all_markers_sub$gene %in% rownames(GetAssayData(seurat_object, slot = "counts"))]
+
+  # If no valid genes are found, skip iteration
+  if (length(valid_genes) == 0) next
+
+  # Compute average expression per cell type
+  avg_sub <- AverageExpression(seurat_sub, features = valid_genes, group.by = group_col)
+  avg_ctl <- AverageExpression(seurat_pbs, features = valid_genes, group.by = group_col)
+
+  # Ensure matrices have the same genes and ordering
+  genes_intersect <- intersect(rownames(avg_sub$RNA), rownames(avg_ctl$RNA))
+  if (length(genes_intersect) == 0) next
+  
+  A <- avg_sub$RNA[genes_intersect, , drop = FALSE]
+  B <- avg_ctl$RNA[genes_intersect, , drop = FALSE]
+
+  # Ensure both matrices have the same cell types
+  common_cols <- intersect(colnames(A), colnames(B))
+  if (length(common_cols) == 0) next
+  
+  A <- A[, common_cols, drop = FALSE]
+  B <- B[, common_cols, drop = FALSE]
+
+  # Compute expression differences using Log2 Fold Change (LFC)
+  exp_diff <- log2((A + 1) / (B + 1))
+  exp_diff[is.na(exp_diff)] <- 0
+  exp_diff[exp_diff > cap] <- cap
+  exp_diff[exp_diff < -cap] <- -cap
+
+  plot_df <- reshape2::melt(as.matrix(exp_diff))
+  colnames(plot_df) <- c("Gene", "Cell_Type", "Log2_Fold_Change")
+  
+    if (isTRUE(use_biomart)) {
+  library(biomaRt)
+  counts <- GetAssayData(seurat_object, assay = "RNA", layer = "counts")
+
+  # Assuming you already have counts
+  ensembl_ids <- rownames(counts)
+  mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+  plot_df <- plot_df %>%
+  dplyr::mutate(ensembl_gene_id = as.character(Gene))
+
+  gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "mgi_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = ensembl_ids,
+  mart       = mart
+) %>%
+  distinct(ensembl_gene_id, mgi_symbol)
+
+  plot_df_mapped <- plot_df %>%
+  left_join(gene_map, by = "ensembl_gene_id") %>%
+  mutate(
+    Gene_symbol = ifelse(is.na(mgi_symbol) | mgi_symbol == "", ensembl_gene_id, mgi_symbol)) %>% 
+    dplyr::select(Gene_original = Gene, Gene_symbol, ensembl_gene_id, Cell_Type, Log2_Fold_Change)
+  
+  plot_df <- plot_df_mapped %>%
+  dplyr::rename(Gene = Gene_symbol)
+  }
+  
+  # columns
+  hc_cols <- hclust(dist(t(exp_diff)))
+      ct_levels <- colnames(exp_diff)[hc_cols$order]
+      ct_levels <- ct_levels[ct_levels %in% unique(plot_df$Cell_Type)]
+      
+   #rows
+        gene_levels <- plot_df %>%
+        dplyr::group_by(Gene) %>%
+        dplyr::summarise(max_abs = max(abs(Log2_Fold_Change), na.rm = TRUE), .groups = "drop") %>%
+        dplyr::arrange(desc(max_abs)) %>%
+        dplyr::pull(Gene)
+  
+    plot_df$Cell_Type <- factor(plot_df$Cell_Type, levels = ct_levels)
+    plot_df$Gene      <- factor(plot_df$Gene,      levels = gene_levels)
+
+  # Plot heatmap of Log2 Fold Change with capped values
+  p <- ggplot(plot_df, aes(x = Cell_Type, y = Gene, fill = Log2_Fold_Change)) +
+    geom_tile() +
+    theme_classic() +
+    scale_fill_gradientn(
+      name = "Log2 Fold Change",
+      colors = colorRampPalette(c("navy", "white", "firebrick3"))(60),
+      limits = c(-2, 2), breaks = c(-2, -1, 0, 1, 2),
+      na.value = "white"  # Avoids grey for missing values
+    ) +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 12),
+      axis.text.y = element_text(face = "italic", size = 12),
+      legend.title = element_text(size = 12),
+      legend.position = "right"
+    )  +
+    scale_y_discrete(position = "right") +
+    ggtitle(paste("Log2 Fold Change:", sample_ii, "vs box")) +
+    coord_fixed()
+
+   fn <- sprintf("%s_%s_by-%s.png",
+                  out_prefix, sample_ii, group_col)
+  save_plot_as_png(p, fn)
+
+  # Display plot
+  #print(p)
+  # inside the loop:
+  # readr::write_csv(plot_df, sprintf("against box analysis/heatmaps/plot_df_%s_%s.csv", sample_ii, group_col))
+  
+}
+}
+
+```
+
+```{r}
+plot_lfc_heatmap(seurat_object, markers_annotations, use_biomart = T, out_prefix = "heatmap",all_combinations, group_col = "cell_annotation")
+```
