@@ -1,0 +1,380 @@
+---
+title: "07_boxplot_demo"
+format: html
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(tibble))
+suppressPackageStartupMessages(library(SeuratObject))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(plyr))
+
+# Function to save plot as PNG
+save_plot_as_png <- function(plot, filename) {
+  png(filename, res = 250, width = 4000, height = 2000)
+  print(plot)
+  dev.off()
+}
+```
+
+
+
+# Why was it done?
+
+Solid-tumor T-cell engineering often yields **condition-specific** transcriptional effects. You wanted a fast, reproducible screen to (1) **flag genes that are selectively elevated** in one sample/condition relative to all others, and (2) **visualize**those differences at whole-dataset and per-cell-type levels with simple stats. This helps prioritize candidate markers/pathways for follow-up (e.g., enrichment, synergy checks, validation).
+
+# Objective
+
+-   **Primary:** Identify genes whose mean expression is **substantially higher in one sample** than the average of the remaining samples, and **summarize/visualize** those genes overall and by cell type.
+
+-   **Operational thresholds:** keep genes expressed in ≥5% of cells; call a gene “selectively high” if its fold change (FC) in any sample vs. the mean of others is **\> 2.5**.
+
+# Summary (what the pipeline does)
+
+1.  Compute **per-sample average expression** for all genes (RNA assay).
+
+2.  Filter to genes expressed in **≥5%** of cells.
+
+3.  For each gene, compute a **sample-wise FC** = (sample mean) / (mean of other samples).
+
+4.  Keep genes with **FC \> 2.5** in *any* sample ⇒ write to `preliminary/significant_foldchange_genes.csv`.
+
+5.  For each retained gene, generate:
+
+    -   **All-cells boxplots** across samples with pairwise **Wilcoxon** p-value annotations.
+
+    -   **Per-cell-type boxplots** (same tests within each cell type).
+
+    -   **Combined panels** (all-cells + each cell type) via cowplot.
+
+6.  Save plots under `plots/all_cells/`, `plots/per_celltype/<celltype>/`, and `plots/cowplot_combined/`.
+
+
+
+```{r}
+#load("../data/demo_data_annotated_nobiomart.RData") 
+#loading this later
+load("../data/demo_data_annotated_biomart.RData")
+```
+
+
+
+# Synergy Genes Table
+
+from 06_synergy_demo.qmd I saved the following
+
+``` r
+write.csv2(exclusive_genes_list_synergy$`4R_12R`,"4R_12R_exclusive_genes_list_synergy.csv")
+```
+
+# and Now i will read
+
+synergy_genes
+
+
+
+```{r}
+synergy_genes_table <- read.csv2("4R_12R_exclusive_genes_list_synergy.csv")
+
+if (!"gene_name" %in% names(synergy_genes_table)) {
+  names(synergy_genes_table)[2] <- "gene_name"
+}
+synergy_genes_table$gene_name <- trimws(synergy_genes_table$gene_name)
+
+head(synergy_genes_table,20)
+```
+
+
+
+converting using biomart
+
+
+
+```{r}
+#counts <- GetAssayData(demo_data, assay = "RNA", layer = "counts")
+ensembl_ids <- synergy_genes_table$gene_name
+library(biomaRt)
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "mgi_symbol"),
+  filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+gene_map_unique <- gene_map[!duplicated(gene_map$ensembl_gene_id), ]
+head(gene_map_unique,20)
+```
+
+```{r}
+synergy_genes_table$mapped_gene_name <- gene_map_unique$mgi_symbol[match(synergy_genes_table$gene_name, gene_map_unique$ensembl_gene_id)]
+synergy_genes_table$mapped_gene_name[is.na(synergy_genes_table$mapped_gene_name)] <- as.character(synergy_genes_table$mapped_gene_name[is.na(synergy_genes_table$mapped_gene_name)])
+
+head(synergy_genes_table,20)
+
+synergy_genes <- synergy_genes_table$mapped_gene_name
+```
+
+
+
+# Methods (code → analysis steps)
+
+-   **Data setup:** `DefaultAssay(demo_data) <- "RNA"`. Use `AverageExpression(..., group.by = "samples")`to get a gene × sample matrix of means.
+
+-   **Expression filter:** `min_cells = 0.05 * ncol(demo_data)`; keep genes with counts\>0 in ≥ min_cells (`Matrix::rowSums(...)`).
+
+-   **Per-sample fold change:** For each gene row, loop over samples *i* and compute `this_val / mean(other_vals)`, with `1e-6` for numerical stability.
+
+-   **Hit list:** select genes with FC\>2.5 in any column.
+
+-   **Statistics & plotting:**
+
+    -   Build long data frames via `FetchData(..., vars = c(gene, "samples"))`.
+
+    -   **Boxplots** (no outliers drawn) + **pairwise Wilcoxon** via `ggpubr::stat_compare_means` across all sample pairs.
+
+    -   Ensure sample ordering (places `"box"` first in the legend/axis if present).
+
+    -   **Per-cell-type** subsets using `metadata$cell_annotation` to stratify.
+
+    -   Combine panels with `cowplot::plot_grid`, save PNGs (300 dpi).
+
+# Tasks automated
+
+-   Gene-level **screening** for selective up-regulation by sample.
+
+-   Batch **plot generation** (overall and per cell type) with inline **p-value labels**.
+
+-   Structured **file outputs** for easy review and downstream use.
+
+
+
+```{r}
+# genes, samples, conditions.
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+
+# Set default assay
+DefaultAssay(demo_data) <- "RNA"
+
+# Step 1: Compute average gene expression per sample
+avg_exp <- AverageExpression(demo_data, group.by = "samples", return.seurat = FALSE)$RNA
+
+min_cells <- 0.02 * ncol(demo_data)
+keep_genes <- rownames(demo_data)[Matrix::rowSums(GetAssayData(demo_data, slot = "counts") > 0) >= min_cells]
+
+# Subset average expression
+avg_exp_filtered <- avg_exp[rownames(avg_exp) %in% keep_genes, ]
+
+
+# Step 2: Compute fold change of each gene in each sample compared to mean of other samples
+fc_matrix <- apply(avg_exp_filtered , 1, function(x) {
+  sapply(seq_along(x), function(i) {
+    this_val <- x[i]
+    other_avg <- mean(x[-i])
+    return(this_val / (other_avg + 1e-6))  # avoid division by zero
+  })
+})
+
+# Step 3: Transpose and convert to dataframe
+fc_df <- as.data.frame(t(fc_matrix))
+colnames(fc_df) <- colnames(avg_exp_filtered )
+fc_df$gene <- rownames(avg_exp_filtered)
+
+
+# Step 4: Filter genes with fold change > 1.5 in any sample
+sig_genes <- fc_df[rowSums(fc_df[, -ncol(fc_df)] > 2.5) > 0, ]
+
+
+# these exclusive_genes_list_synergy is from the 06_synergy_demo.qmd
+genes_in_common <- sig_genes %>%
+ dplyr::filter(gene %in% synergy_genes)
+
+genes_in_common
+
+
+# write.csv(sig_genes, "significant_foldchange_genes.csv", row.names = FALSE)
+
+```
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+# ---------------- Setup ----------------
+DefaultAssay(demo_data) <- "RNA"
+expr_matrix <- GetAssayData(demo_data, slot = "data")  # assumes NormalizeData done
+metadata <- demo_data@meta.data
+
+# Get a CHARACTER VECTOR of gene names (not rows of df)
+top_genes <- genes_in_common$gene
+top_genes <- head(unique(genes_in_common$gene), 4)
+
+celltypes <- unique(metadata$cell_annotation)
+
+# Helper: boxplot
+plot_box <- function(df, gene, title_prefix) {
+  boxplot1 <- ggplot(df, aes(x = samples, y = expression, fill = samples)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, color = "black") +
+    stat_compare_means(
+      method = "wilcox.test",
+      comparisons = combn(levels(factor(df$samples)), 2, simplify = FALSE),
+      label = "p.signif"
+    ) +
+    theme_minimal(base_size = 13) +
+    ggtitle(paste(title_prefix, gene)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ylab("Expression Level") + xlab("Sample")
+  return(boxplot1)
+}
+```
+
+```{r}
+# Create base directories
+dir.create("plots/all_cells", recursive = TRUE, showWarnings = FALSE)
+dir.create("plots/per_celltype", recursive = TRUE, showWarnings = FALSE)
+
+# ---------------- General Boxplots (All Cells) ----------------
+cat("📤 Saving all-cells boxplots...\n")
+n_all <- 0
+
+for (g in top_genes) {
+  # scalar checks only
+  if (!(g %in% rownames(expr_matrix))) next
+
+  file_path <- file.path("plots/all_cells", paste0(g, "_boxplot.png"))
+  if (file.exists(file_path)) next
+
+  # use the SAME object you prepared (demo_data)
+  df <- FetchData(demo_data, vars = c(g, "samples")) %>%
+    setNames(c("expression", "samples"))
+
+  p <- plot_box(df, g, title_prefix = "All Cells — ")
+
+  ggsave(filename = file_path, plot = p, width = 7, height = 5, dpi = 300)
+  n_all <- n_all + 1
+}
+print(p)
+cat("✅ New all-cell plots saved:", n_all, "\n")
+
+```
+
+```{r}
+
+# ---------------- Per-Celltype Boxplots ----------------
+cat("📤 Saving per-celltype boxplots...\n")
+n_ct <- 0
+
+for (g in top_genes) {
+  if (!(g %in% rownames(expr_matrix))) next
+
+  for (ct in celltypes) {
+    out_dir <- file.path("plots/per_celltype", gsub("[/ ]", "_", ct))
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+    file_path <- file.path(out_dir, paste0(g, "_", gsub("[/ ]", "_", ct), ".png"))
+    if (file.exists(file_path)) next
+
+    cell_ids <- rownames(metadata)[metadata$cell_annotation == ct]
+    cell_ids <- intersect(cell_ids, colnames(expr_matrix))
+    if (length(cell_ids) < 2) next  # need ≥2 for boxplot + stats
+
+    df <- data.frame(
+      expression = as.numeric(expr_matrix[g, cell_ids]),
+      samples    = metadata[cell_ids, "samples", drop = TRUE],
+      stringsAsFactors = FALSE
+    )
+
+    p <- plot_box(df, g, title_prefix = paste("Cell Type:", ct, "—"))
+    ggsave(filename = file_path, plot = p, width = 7, height = 5, dpi = 300)
+    n_ct <- n_ct + 1
+  }
+}
+print(p)
+cat("✅ New per-celltype plots saved:", n_ct, "\n")
+```
+
+```{r}
+library(cowplot)
+
+dir.create("plots/cowplot_combined", recursive = TRUE, showWarnings = FALSE)
+
+# Loop over genes
+for (gene in top_genes) {
+  if (!(gene %in% rownames(expr_matrix))) next
+
+  plots <- list()
+
+  # All cells plot
+  df_all <- FetchData(demo_data, vars = c(gene, "samples")) %>%
+    setNames(c("expression", "samples"))
+  plots[[1]] <- plot_box(df_all, gene, title_prefix = "All Cells — ")
+
+  # Per-celltype plots
+  for (ct in celltypes) {
+    cell_ids <- rownames(metadata %>% filter(cell_annotation == ct))
+    expr_values <- expr_matrix[gene, cell_ids]
+
+    df <- data.frame(
+      expression = as.numeric(expr_values),
+      samples = metadata[cell_ids, "samples"]
+    )
+    plots[[length(plots) + 1]] <- plot_box(df, gene, title_prefix = paste("Cell Type:", ct, "—"))
+  }
+
+  # Combine and save
+  combined <- cowplot::plot_grid(plotlist = plots, ncol = 2)
+  ggsave(filename = paste0("plots/cowplot_combined/", gene, "_combined.png"),
+         plot = combined, width = 14, height = 8, dpi = 300)
+}
+```
+
+
+
+```         
+Warning in wilcox.test.default(c(0, 0, 0, 0, 0, 0), c(0.707499905428215,  :
+  cannot compute exact p-value with ties
+
+HAPPENS BECAUSE
+
+Those warnings are from the Wilcoxon rank-sum test inside stat_compare_means().
+They happen when your two groups have many tied values (e.g., lots of 0’s in scRNA-seq), so the test can’t compute the exact p-value and falls back to an asymptotic one.
+This is normal for zero-inflated single-cell data and doesn’t invalidate the plot; it’s just telling you why it switched methods.
+```
+
+# Results
+
+-   **Hit count:** `N` genes passed FC\>2.5 in ≥1 sample (see `significant_foldchange_genes.csv`).
+
+-   **Top examples:** e.g., `GeneA`, `GeneB`, `GeneC` peak in **Sample X**; `GeneD` peaks in **Sample Y**.
+
+-   **Per-cell-type specificity:** In cell type **T**, `GeneA` remains highest in **Sample X** (Wilcoxon p \< 0.01 across comparisons), suggesting true condition-specific regulation rather than compositional effects.
+
+-   **Figure references:**
+
+    -   All-cells boxplots: `plots/all_cells/<gene>_boxplot.png`
+
+    -   Per-cell-type boxplots: `plots/per_celltype/<celltype>/<gene>_<celltype>.png`
+
+    -   Combined panels: `plots/cowplot_combined/<gene>_combined.png`
+
+# Interpretation & caveats
+
+-   **What it tells you:** a quick, interpretable list of **condition-selective genes**, with visual confirmation globally and within cell types.
+
+-   **Caveats:**
+
+    -   Using **means** on scRNA-seq can be influenced by zero inflation and rare high expressers; consider also **median** or **trimmed mean** and/or **pseudobulk** per sample.
+
+    -   Pairwise Wilcoxon across many sample pairs per gene introduces **multiple-testing** concerns—treat p-labels as screening hints, and confirm in a DE framework if you plan claims.
+
+    -   If “box” is a non-biological control/batch, keep it for QC but avoid over-interpreting biological contrasts against it.
+
